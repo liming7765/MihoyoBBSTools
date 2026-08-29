@@ -1,0 +1,387 @@
+name: Safe Auto Sync Upstream
+
+on:
+  schedule:
+    # 每周一北京时间 12:23 检查一次
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: safe-auto-sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Womsxd/MihoyoBBSTools
+  UPSTREAM_BRANCH: master
+  # 你的本地改动已经包含了该上游提交的内容：
+  # fix: invalid bg url in smtp push;
+  UPSTREAM_ANCHOR: 01bb6c9f8760aee593da0b9a1365feda12a89e28
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git and fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+      - name: Safely merge upstream
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_HEAD="$(git rev-parse HEAD)"
+          UPSTREAM_HEAD="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+
+          echo "original_head=${ORIGINAL_HEAD}" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=${UPSTREAM_HEAD}" >> "$GITHUB_OUTPUT"
+
+          # 输出结果并正常结束，让后续 Telegram 通知有机会执行。
+          finish() {
+            local result="$1"
+            local detail="$2"
+            {
+              echo "result=${result}"
+              echo "detail<<EOF"
+              echo "${detail}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          rollback_all() {
+            git merge --abort >/dev/null 2>&1 || true
+            git reset --hard "${ORIGINAL_HEAD}" >/dev/null 2>&1 || true
+          }
+
+          # ------------------------------------------------------------
+          # 第一次运行：建立真正的 upstream ancestry。
+          # 不重写你已有的任何 commit，只新增一个双 parent 的 merge commit。
+          # 在建立关系前先验证核心文件，防止锚点猜错。
+          # ------------------------------------------------------------
+          if ! git merge-base HEAD "upstream/${UPSTREAM_BRANCH}" >/dev/null 2>&1; then
+            echo "No common Git ancestor found; validating the historical anchor..."
+
+            # 这些文件在你当前仓库中应当与 01bb6c9 完全一致。
+            CORE_FILES=(
+              account.py
+              captcha.py
+              cloudgames.py
+              config.py
+              gamecheckin.py
+              main.py
+              main_multi.py
+              mihoyobbs.py
+              push.py
+              request.py
+              setting.py
+              requirements.txt
+            )
+
+            mismatches=()
+            for file in "${CORE_FILES[@]}"; do
+              if ! git cat-file -e "${UPSTREAM_ANCHOR}:${file}" 2>/dev/null; then
+                mismatches+=("${file}: missing in upstream anchor")
+                continue
+              fi
+              if ! git cat-file -e "HEAD:${file}" 2>/dev/null; then
+                mismatches+=("${file}: missing locally")
+                continue
+              fi
+
+              ours="$(git rev-parse "HEAD:${file}")"
+              base="$(git rev-parse "${UPSTREAM_ANCHOR}:${file}")"
+              if [[ "${ours}" != "${base}" ]]; then
+                mismatches+=("${file}")
+              fi
+            done
+
+            if (( ${#mismatches[@]} > 0 )); then
+              detail="首次同步安全检查未通过。以下核心文件与预期上游锚点不同： ${mismatches[*]}。为避免覆盖你的定制，本次没有修改仓库。"
+              finish "blocked" "${detail}"
+              exit 0
+            fi
+
+            # 额外检查：除了明确的本地定制/隐藏仓库文件，不应存在未知差异。
+            # README/LICENSE 在你的隐蔽副本中有意不保留；
+            # utils.py / cleanup.py / .github 是你的本地功能。
+            unexpected="$(
+              git diff --name-only "${UPSTREAM_ANCHOR}" HEAD -- \
+                . \
+                ':(exclude).github/**' \
+                ':(exclude)utils.py' \
+                ':(exclude)cleanup.py' \
+                ':(exclude)README.md' \
+                ':(exclude)LICENSE' \
+              || true
+            )"
+
+            if [[ -n "${unexpected}" ]]; then
+              detail="首次同步发现未登记的本地差异，已停止： $(echo "${unexpected}" | tr '\n' ' ')"
+              finish "blocked" "${detail}"
+              exit 0
+            fi
+
+            # -s ours 只建立 ancestry，不改工作树内容。
+            git merge \
+              -s ours \
+              --allow-unrelated-histories \
+              "${UPSTREAM_ANCHOR}" \
+              -m "chore(sync): establish upstream ancestry at 01bb6c9"
+
+            echo "Upstream ancestry established locally."
+          fi
+
+          # 已经同步到最新版本。
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            # 如果刚才只建立了锚点但 upstream 恰好就是锚点，不单独推一个无意义提交。
+            if [[ "$(git rev-parse HEAD)" != "${ORIGINAL_HEAD}" ]]; then
+              git reset --hard "${ORIGINAL_HEAD}"
+            fi
+            finish "noop" "已是最新版本，无需同步。"
+            exit 0
+          fi
+
+          BEFORE_MERGE="$(git rev-parse HEAD)"
+
+          # ------------------------------------------------------------
+          # 尝试正常三方合并。
+          # .github / README / LICENSE 始终以你自己的仓库为准。
+          # ------------------------------------------------------------
+          set +e
+          git merge --no-ff --no-commit "upstream/${UPSTREAM_BRANCH}"
+          merge_rc=$?
+          set -e
+
+          restore_exact_path() {
+            local path="$1"
+
+            # 删除 merge 后该路径的所有版本/新增文件。
+            git rm -r -f --ignore-unmatch -- "${path}" >/dev/null 2>&1 || true
+
+            # 如果合并前存在，则完整恢复；如果原本不存在，就保持不存在。
+            if git cat-file -e "${BEFORE_MERGE}:${path}" 2>/dev/null; then
+              git checkout "${BEFORE_MERGE}" -- "${path}"
+            fi
+          }
+
+          # 无论上游怎样改 workflow，都绝不导入。
+          restore_exact_path ".github"
+          restore_exact_path "README.md"
+          restore_exact_path "LICENSE"
+
+          unresolved="$(git diff --name-only --diff-filter=U || true)"
+          if [[ -n "${unresolved}" ]]; then
+            rollback_all
+            detail="上游更新产生代码冲突，已安全取消，没有修改 master。冲突文件： $(echo "${unresolved}" | tr '\n' ' ')"
+            finish "blocked" "${detail}"
+            exit 0
+          fi
+
+          # merge 返回非 0，但冲突若仅来自受保护路径并已经处理干净，可继续。
+          if [[ "${merge_rc}" -ne 0 ]]; then
+            echo "Merge originally reported conflicts, but protected-path conflicts were resolved locally."
+          fi
+
+          # ------------------------------------------------------------
+          # “破坏性”安全闸。
+          # ------------------------------------------------------------
+          CHANGES_FILE="$(mktemp)"
+          git diff --cached --name-status "${BEFORE_MERGE}" > "${CHANGES_FILE}"
+
+          echo "Changes proposed by upstream:"
+          cat "${CHANGES_FILE}" || true
+
+          changed_count="$(wc -l < "${CHANGES_FILE}" | tr -d ' ')"
+          delete_count="$(grep -Ec '^(D|R)' "${CHANGES_FILE}" || true)"
+
+          # 改动规模异常大时交给人工。
+          if (( changed_count > 40 || delete_count > 5 )); then
+            rollback_all
+            detail="上游本次改动规模较大（${changed_count} 个路径，删除/重命名 ${delete_count} 个），按破坏性更新处理，未自动合并。"
+            finish "blocked" "${detail}"
+            exit 0
+          fi
+
+          # 关键入口/配置绝不能被删除或重命名。
+          CRITICAL_FILES=(
+            main.py
+            main_multi.py
+            account.py
+            config.py
+            setting.py
+            request.py
+            mihoyobbs.py
+            gamecheckin.py
+            requirements.txt
+            config/config.yaml.example
+          )
+
+          for file in "${CRITICAL_FILES[@]}"; do
+            if [[ ! -e "${file}" ]]; then
+              rollback_all
+              finish "blocked" "上游更新导致关键文件 ${file} 消失，已取消自动同步。"
+              exit 0
+            fi
+          done
+
+          while IFS=$'\t' read -r status p1 p2; do
+            [[ -z "${status}" ]] && continue
+            if [[ "${status}" == D* || "${status}" == R* ]]; then
+              for critical in "${CRITICAL_FILES[@]}"; do
+                if [[ "${p1}" == "${critical}" || "${p2:-}" == "${critical}" ]]; then
+                  rollback_all
+                  finish "blocked" "上游删除/重命名了关键文件 ${critical}，已取消自动同步。"
+                  exit 0
+                fi
+              done
+            fi
+          done < "${CHANGES_FILE}"
+
+          # 不允许上游悄悄改变 GitHub Actions/Runner 环境识别逻辑，
+          # 因为你的 utils.py 依赖移除 GITHUB_ACTIONS 后再启动主程序。
+          suspicious="$(
+            git diff --cached -U0 "${BEFORE_MERGE}" -- '*.py' \
+              | grep '^+' \
+              | grep -Ev '^\+\+\+' \
+              | grep -E 'GITHUB_ACTIONS|GITHUB_WORKFLOW|GITHUB_REPOSITORY|RUNNER_OS|RUNNER_ENVIRONMENT' \
+              || true
+          )"
+
+          if [[ -n "${suspicious}" ]]; then
+            rollback_all
+            finish "blocked" "上游修改了 GitHub Actions/Runner 环境检测相关代码，可能影响你的绕行方式，已取消自动同步。"
+            exit 0
+          fi
+
+          # requirements 若引入 VCS/任意 URL/额外源，先人工审查。
+          if git diff --cached --quiet "${BEFORE_MERGE}" -- requirements.txt; then
+            :
+          else
+            if grep -Ev '^\s*(#|$)' requirements.txt \
+              | grep -E 'git\+|https?://|--extra-index-url|--index-url|^-e ' >/dev/null; then
+              rollback_all
+              finish "blocked" "requirements.txt 引入了 URL/VCS/额外包源，按高风险依赖变更处理，未自动同步。"
+              exit 0
+            fi
+          fi
+
+          # 确认你的本地 Actions 没被 upstream 改到。
+          if ! git diff --quiet "${BEFORE_MERGE}" -- .github; then
+            rollback_all
+            finish "blocked" ".github 保护检查失败，已取消同步。"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------
+          # 只做静态检查，不执行上游代码，也不把业务 Secrets 暴露给它。
+          # ------------------------------------------------------------
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          errors = []
+          for path in Path(".").rglob("*.py"):
+              if ".git" in path.parts:
+                  continue
+              try:
+                  ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+              except Exception as exc:
+                  errors.append(f"{path}: {exc}")
+
+          if errors:
+              raise SystemExit("Python syntax check failed:\n" + "\n".join(errors))
+
+          text = Path("main_multi.py").read_text(encoding="utf-8")
+          if "autorun" not in text:
+              raise SystemExit("main_multi.py no longer appears to support the autorun entry used by utils.py")
+
+          if not Path("config/config.yaml.example").is_file():
+              raise SystemExit("config/config.yaml.example is missing")
+          PY
+
+          # 如果上游只改了受保护文件，恢复后可能没有文件差异。
+          # 仍然可以用 merge commit 标记“该 upstream 已审查并同步”，
+          # 这不是 keepalive，不会伪造活动目的。
+          SHORT_UPSTREAM="$(git rev-parse --short=12 "upstream/${UPSTREAM_BRANCH}")"
+
+          git commit -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${SHORT_UPSTREAM}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          changed_summary="$(awk '{print $1 " " $2}' "${CHANGES_FILE}" | head -20 | tr '\n' '; ')"
+          finish "synced" "已自动安全同步 upstream ${SHORT_UPSTREAM}。变更：${changed_summary}"
+
+      - name: Telegram notification
+        if: always() && (steps.sync.outputs.result == 'synced' || steps.sync.outputs.result == 'blocked')
+        env:
+          PUSH_CONFIG: ${{ secrets.PUSH_CONFIG }}
+          RESULT: ${{ steps.sync.outputs.result }}
+          DETAIL: ${{ steps.sync.outputs.detail }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          try:
+              cfg = json.loads(os.environ.get("PUSH_CONFIG", "{}"))
+              if not cfg.get("enable"):
+                  raise SystemExit(0)
+
+              tg = cfg.get("telegram", {})
+              token = tg.get("bot_token")
+              chat_id = tg.get("chat_id")
+              api_host = tg.get("api_url", "api.telegram.org")
+
+              if not token or not chat_id:
+                  raise SystemExit(0)
+
+              result = os.environ.get("RESULT")
+              detail = os.environ.get("DETAIL", "")
+              repo = os.environ.get("REPOSITORY", "")
+
+              icon = "✅" if result == "synced" else "⚠️"
+              title = "上游已自动同步" if result == "synced" else "上游同步需要人工检查"
+              text = f"{icon} {title}\n\n{repo}\n{detail}"
+
+              data = urllib.parse.urlencode({
+                  "chat_id": chat_id,
+                  "text": text,
+              }).encode()
+
+              req = urllib.request.Request(
+                  f"https://{api_host}/bot{token}/sendMessage",
+                  data=data,
+                  method="POST",
+              )
+              urllib.request.urlopen(req, timeout=15).read()
+          except Exception as exc:
+              print(f"Telegram notification failed: {exc}")
+          PY
+
+      - name: Mark blocked sync as failed
+        if: steps.sync.outputs.result == 'blocked'
+        shell: bash
+        run: |
+          echo "::error::${{ steps.sync.outputs.detail }}"
+          exit 1
